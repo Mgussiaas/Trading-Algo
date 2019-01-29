@@ -1,3 +1,8 @@
+$ pipenv install
+$ pipenv shell
+
+
+
 def main():
     done = None
     logging.info('start running')
