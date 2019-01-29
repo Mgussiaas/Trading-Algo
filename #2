@@ -1,14 +1,28 @@
-from quantopian.pipeline import Pipeline
-from quantopian.algorithm import attach_pipeline, pipeline_output
-from quantopian.pipeline.data.builtin import USEquityPricing
-from quantopian.pipeline.data import morningstar
-from quantopian.pipeline.factors import SimpleMovingAverage, AverageDollarVolume
-from quantopian.pipeline.filters.morningstar import IsPrimaryShare
+def main():
+    done = None
+    logging.info('start running')
+    while True:
+        # clock API returns the server time including
+        # the boolean flag for market open
+        clock = api.get_clock()
+        now = clock.timestamp
+        if clock.is_open and done != now.strftime('%Y-%m-%d'):
 
-import numpy as np  # needed for NaN handling
-import math  # ceil and floor are useful for rounding
+            price_df = prices(Universe)
+            orders = get_orders(api, price_df)
+            trade(orders)
 
-from itertools import cycle
+            # flag it as done so it doesn't work again for the day
+            # TODO: this isn't tolerant to process restarts, so this
+            # flag should probably be saved on disk
+            done = now.strftime('%Y-%m-%d')
+            logger.info(f'done for {done}')
+
+        time.sleep(1)
+   main()
+   
+# SP500
+Universe = ['MMM', 'ABT', 'ABBV', 'ACN', 'ATVI', 'AYI', 'ADBE', 'ZTS']
 
 import alpaca_trade_api as tradeapi
 
@@ -18,346 +32,171 @@ api = tradeapi.REST(
     base_url='https://paper-api.alpaca.markets'
 )
 
+def prices(symbols):
+    now = pd.Timestamp.now(tz=NY)
+    end_dt = now
+    if now.time() >= pd.Timestamp('09:30', tz=NY).time():
+        end_dt = now - \
+            pd.Timedelta(now.strftime('%H:%M:%S')) - pd.Timedelta('1 minute')
+    return _get_prices(symbols, end_dt)
 
-def initialize(context):
-    # set_commission(commission.PerShare(cost=0.00, min_trade_cost=1.50))
-    set_slippage(
-        slippage.VolumeShareSlippage(
-            volume_limit=.20,
-            price_impact=0.0))
-    # set_slippage(slippage.FixedSlippage(spread=0.00))
-    set_commission(commission.PerTrade(cost=0.00))
-    # set_slippage(slippage.FixedSlippage(spread=0.00))
-    set_long_only()
+def _get_prices(symbols, end_dt, max_workers=5):
+    '''Get the map of DataFrame price data from Alpaca's data API.'''
 
-    context.MaxCandidates = 100
-    context.MaxBuyOrdersAtOnce = 30
-    context.MyLeastPrice = 3.00
-    context.MyMostPrice = 25.00
-    context.MyFireSalePrice = context.MyLeastPrice
-    context.MyFireSaleAge = 6
+    start_dt = end_dt - pd.Timedelta('50 days')
+    start = start_dt.strftime('%Y-%-m-%-d')
+    end = end_dt.strftime('%Y-%-m-%-d')
 
-    # over simplistic tracking of position age
-    context.age = {}
-    print len(context.portfolio.positions)
+    def get_barset(symbols):
+        return api.get_barset(
+            symbols,
+            'day',
+            limit = 50,
+            start=start,
+            end=end
+        )
 
-    # Rebalance
-    EveryThisManyMinutes = 10
-    TradingDayHours = 6.5
-    TradingDayMinutes = int(TradingDayHours * 60)
-    for minutez in xrange(
-        1,
-        TradingDayMinutes,
-        EveryThisManyMinutes
-    ):
-        schedule_function(
-            my_rebalance,
-            date_rules.every_day(),
-            time_rules.market_open(
-                minutes=minutez))
-
-    # Prevent excessive logging of canceled orders at market close.
-    schedule_function(
-        cancel_open_orders,
-        date_rules.every_day(),
-        time_rules.market_close(
-            hours=0,
-            minutes=1))
-
-    # Record variables at the end of each day.
-    schedule_function(
-        my_record_vars,
-        date_rules.every_day(),
-        time_rules.market_close())
-
-    # Create our pipeline and attach it to our algorithm.
-    my_pipe = make_pipeline(context)
-    attach_pipeline(my_pipe, 'my_pipeline')
-
-
-def make_pipeline(context):
-    """
-    Create our pipeline.
-    """
-
-    # Filter for primary share equities. IsPrimaryShare is a built-in filter.
-    primary_share = IsPrimaryShare()
-
-    # Equities listed as common stock (as opposed to, say, preferred stock).
-    # 'ST00000001' indicates common stock.
-    common_stock = morningstar.share_class_reference.security_type.latest.eq(
-        'ST00000001')
-
-    # Non-depositary receipts. Recall that the ~ operator inverts filters,
-    # turning Trues into Falses and vice versa
-    not_depositary = ~morningstar.share_class_reference.is_depositary_receipt.latest
-
-    # Equities not trading over-the-counter.
-    not_otc = ~morningstar.share_class_reference.exchange_id.latest.startswith(
-        'OTC')
-
-    # Not when-issued equities.
-    not_wi = ~morningstar.share_class_reference.symbol.latest.endswith('.WI')
-
-    # Equities without LP in their name, .matches does a match using a regular
-    # expression
-    not_lp_name = ~morningstar.company_reference.standard_name.latest.matches(
-        '.* L[. ]?P.?$')
-
-    # Equities with a null value in the limited_partnership Morningstar
-    # fundamental field.
-    not_lp_balance_sheet = morningstar.balance_sheet.limited_partnership.latest.isnull()
-
-    # Equities whose most recent Morningstar market cap is not null have
-    # fundamental data and therefore are not ETFs.
-    have_market_cap = morningstar.valuation.market_cap.latest.notnull()
-
-    # At least a certain price
-    price = USEquityPricing.close.latest
-    AtLeastPrice = (price >= context.MyLeastPrice)
-    AtMostPrice = (price <= context.MyMostPrice)
-
-    # Filter for stocks that pass all of our previous filters.
-    tradeable_stocks = (
-        primary_share
-        & common_stock
-        & not_depositary
-        & not_otc
-        & not_wi
-        & not_lp_name
-        & not_lp_balance_sheet
-        & have_market_cap
-        & AtLeastPrice
-        & AtMostPrice
-    )
-
-    LowVar = 6
-    HighVar = 40
-
-    log.info(
-        '''
-Algorithm initialized variables:
- context.MaxCandidates %s
- LowVar %s
- HighVar %s''' %
-        (context.MaxCandidates, LowVar, HighVar))
-
-    # High dollar volume filter.
-    base_universe = AverageDollarVolume(
-        window_length=20,
-        mask=tradeable_stocks
-    ).percentile_between(LowVar, HighVar)
-
-    # Short close price average.
-    ShortAvg = SimpleMovingAverage(
-        inputs=[USEquityPricing.close],
-        window_length=3,
-        mask=base_universe
-    )
-
-    # Long close price average.
-    LongAvg = SimpleMovingAverage(
-        inputs=[USEquityPricing.close],
-        window_length=45,
-        mask=base_universe
-    )
-
-    percent_difference = (ShortAvg - LongAvg) / LongAvg
-
-    # Filter to select securities to long.
-    stocks_worst = percent_difference.bottom(context.MaxCandidates)
-    securities_to_trade = (stocks_worst)
-
-    return Pipeline(
-        columns={
-            'stocks_worst': stocks_worst
-        },
-        screen=(securities_to_trade),
-    )
-
-
-def my_compute_weights(context):
-    """
-    Compute ordering weights.
-    """
-    # Compute even target weights for our long positions and short positions.
-    stocks_worst_weight = 1.00 / len(context.stocks_worst)
-
-    return stocks_worst_weight
-
-
-def before_trading_start(context, data):
-    # Gets our pipeline output every day.
-    context.output = pipeline_output('my_pipeline')
-
-    context.stocks_worst = context.output[
-        context.output['stocks_worst']].index.tolist()
-
-    context.stocks_worst_weight = my_compute_weights(context)
-
-    context.MyCandidate = cycle(context.stocks_worst)
-
-    context.LowestPrice = context.MyLeastPrice  # reset beginning of day
-    print len(context.portfolio.positions)
-    for stock in context.portfolio.positions:
-        CurrPrice = float(data.current([stock], 'price'))
-        if CurrPrice < context.LowestPrice:
-            context.LowestPrice = CurrPrice
-        if stock in context.age:
-            context.age[stock] += 1
+    # The maximum number of symbols we can request at once is 200.
+    barset = None
+    idx = 0
+    while idx <= len(symbols) - 1:
+        if barset is None:
+            barset = get_barset(symbols[idx:idx+200])
         else:
-            context.age[stock] = 1
-    for stock in context.age:
-        if stock not in context.portfolio.positions:
-            context.age[stock] = 0
-        message = 'stock.symbol: {symbol}  :  age: {age}'
-        log.info(message.format(symbol=stock.symbol, age=context.age[stock]))
+            barset.update(get_barset(symbols[idx:idx+200]))
+        idx += 200
 
-    pass
+    return barset.df
 
+def calc_scores(price_df, dayindex=-1):
+    '''Calculate scores based on the indicator and
+    return the sorted result.
+    '''
+    diffs = {}
+    param = 10
+    for symbol in price_df.columns.levels[0]:
+        df = price_df[symbol]
+        if len(df.close.values) <= param:
+            continue
+        ema = df.close.ewm(span=param).mean()[dayindex]
+        last = df.close.values[dayindex]
+        diff = (last - ema) / last
+        diffs[symbol] = diff
 
-def my_rebalance(context, data):
-    BuyFactor = .99
-    SellFactor = 1.01
-    cash = context.portfolio.cash
+    return sorted(diffs.items(), key=lambda x: x[1])
 
-    cancel_open_buy_orders(context, data)
+def get_orders(api, price_df, position_size=100, max_positions=5):
+    '''Calculate the scores within the universe to build the optimal
+    portfolio as of today, and extract orders to transition from our
+    current portfolio to the desired state.
+    '''
+    # rank the stocks based on the indicators.
+    ranked = calc_scores(price_df)
+    to_buy = set()
+    to_sell = set()
+    account = api.get_account()
+    # take the top one twentieth out of ranking,
+    # excluding stocks too expensive to buy a share
+    for symbol, _ in ranked[:len(ranked) // 20]:
+        price = float(price_df[symbol].close.values[-1])
+        if price > float(account.cash):
+            continue
+        to_buy.add(symbol)
 
-    # Order sell at profit target in hope that somebody actually buys it
-    for stock in context.portfolio.positions:
-        if not get_open_orders(stock):
-            StockShares = context.portfolio.positions[stock].amount
-            CurrPrice = float(data.current([stock], 'price'))
-            CostBasis = float(context.portfolio.positions[stock].cost_basis)
-            SellPrice = float(
-                make_div_by_05(
-                    CostBasis *
-                    SellFactor,
-                    buy=False))
+    # now get the current positions and see what to buy,
+    # what to sell to transition to today's desired portfolio.
+    positions = api.list_positions()
+    logger.info(positions)
+    holdings = {p.symbol: p for p in positions}
+    holding_symbol = set(holdings.keys())
+    to_sell = holding_symbol - to_buy
+    to_buy = to_buy - holding_symbol
+    orders = []
 
-            if np.isnan(SellPrice):
-                pass  # probably best to wait until nan goes away
-            elif (stock in context.age and context.age[stock] == 1):
-                pass
-            elif (
-                stock in context.age
-                and context.MyFireSaleAge <= context.age[stock]
-                and (
-                    context.MyFireSalePrice > CurrPrice
-                    or CostBasis > CurrPrice
-                )
-            ):
-                if (stock in context.age and context.age[stock] < 2):
-                    pass
-                elif stock not in context.age:
-                    context.age[stock] = 1
-                else:
-                    SellPrice = float(
-                        make_div_by_05(.95 * CurrPrice, buy=False))
-                    order(stock, -StockShares,
-                          style=LimitOrder(SellPrice)
-                          )
-            else:
-                if (stock in context.age and context.age[stock] < 2):
-                    pass
-                elif stock not in context.age:
-                    context.age[stock] = 1
-                else:
+    # if a stock is in the portfolio, and not in the desired
+    # portfolio, sell it
+    for symbol in to_sell:
+        shares = holdings[symbol].qty
+        orders.append({
+            'symbol': symbol,
+            'qty': shares,
+            'side': 'sell',
+        })
+        logger.info(f'order(sell): {symbol} for {shares}')
 
-                    order(stock, -StockShares,
-                          style=LimitOrder(SellPrice)
-                          )
+    # likewise, if the portfolio is missing stocks from the
+    # desired portfolio, buy them. We sent a limit for the total
+    # position size so that we don't end up holding too many positions.
+    max_to_buy = max_positions - (len(positions) - len(to_sell))
+    for symbol in to_buy:
+        if max_to_buy <= 0:
+            break
+        shares = position_size // float(price_df[symbol].close.values[-1])
+        if shares == 0.0:
+            continue
+        orders.append({
+            'symbol': symbol,
+            'qty': shares,
+            'side': 'buy',
+        })
+        logger.info(f'order(buy): {symbol} for {shares}')
+        max_to_buy -= 1
+    return orders
 
-    WeightThisBuyOrder = float(1.00 / context.MaxBuyOrdersAtOnce)
-    for ThisBuyOrder in range(context.MaxBuyOrdersAtOnce):
-        stock = context.MyCandidate.next()
-        PH = data.history([stock], 'price', 20, '1d')
-        PH_Avg = float(PH.mean())
-        CurrPrice = float(data.current([stock], 'price'))
-        if np.isnan(CurrPrice):
-            pass  # probably best to wait until nan goes away
-        else:
-            if CurrPrice > float(1.25 * PH_Avg):
-                BuyPrice = float(CurrPrice)
-            else:
-                BuyPrice = float(CurrPrice * BuyFactor)
-            BuyPrice = float(make_div_by_05(BuyPrice, buy=True))
-            StockShares = int(WeightThisBuyOrder * cash / BuyPrice)
-            order(stock, StockShares,
-                  style=LimitOrder(BuyPrice)
-                  )
+def trade(orders, wait=30):
+    '''This is where we actually submit the orders and wait for them to fill.
+    Waiting is an important step since the orders aren't filled automatically,
+    which means if your buys happen to come before your sells have filled,
+    the buy orders will be bounced. In order to make the transition smooth,
+    we sell first and wait for all the sell orders to fill before submitting
+    our buy orders.
+    '''
 
-# if cents not divisible by .05, round down if buy, round up if sell
+    # process the sell orders first
+    sells = [o for o in orders if o['side'] == 'sell']
+    for order in sells:
+        try:
+            logger.info(f'submit(sell): {order}')
+            api.submit_order(
+                symbol=order['symbol'],
+                qty=order['qty'],
+                side='sell',
+                type='market',
+                time_in_force='day',
+            )
+        except Exception as e:
+            logger.error(e)
+    count = wait
+    while count > 0:
+        pending = api.list_orders()
+        if len(pending) == 0:
+            logger.info(f'all sell orders done')
+            break
+        logger.info(f'{len(pending)} sell orders pending...')
+        time.sleep(1)
+        count -= 1
 
+    # process the buy orders next
+    buys = [o for o in orders if o['side'] == 'buy']
+    for order in buys:
+        try:
+            logger.info(f'submit(buy): {order}')
+            api.submit_order(
+                symbol=order['symbol'],
+                qty=order['qty'],
+                side='buy',
+                type='market',
+                time_in_force='day',
+            )
+        except Exception as e:
+            logger.error(e)
+    count = wait
+    while count > 0:
+        pending = api.list_orders()
+        if len(pending) == 0:
+            logger.info(f'all buy orders done')
+            break
+        logger.info(f'{len(pending)} buy orders pending...')
+        time.sleep(1)
+        count -= 1
 
-def make_div_by_05(s, buy=False):
-    s *= 20.00
-    s = math.floor(s) if buy else math.ceil(s)
-    s /= 20.00
-    return s
-
-
-def my_record_vars(context, data):
-    """
-    Record variables at the end of each day.
-    """
-
-    # Record our variables.
-    record(leverage=context.account.leverage)
-    record(positions=len(context.portfolio.positions))
-    if 0 < len(context.age):
-        MaxAge = context.age[max(
-            context.age.keys(), key=(lambda k: context.age[k]))]
-        print MaxAge
-        record(MaxAge=MaxAge)
-    record(LowestPrice=context.LowestPrice)
-
-
-def log_open_order(StockToLog):
-    oo = get_open_orders()
-    if len(oo) == 0:
-        return
-    for stock, orders in oo.iteritems():
-        if stock == StockToLog:
-            for o in orders:
-                message = 'Found open order for {amount} shares in {stock}'
-                log.info(message.format(amount=o.amount, stock=stock))
-
-
-def log_open_orders():
-    oo = get_open_orders()
-    if len(oo) == 0:
-        return
-    for stock, orders in oo.iteritems():
-        for o in orders:
-            message = 'Found open order for {amount} shares in {stock}'
-            log.info(message.format(amount=o.amount, stock=stock))
-
-
-def cancel_open_buy_orders(context, data):
-    oo = get_open_orders()
-    if len(oo) == 0:
-        return
-    for stock, orders in oo.iteritems():
-        for o in orders:
-            # message = 'Canceling order of {amount} shares in {stock}'
-            # log.info(message.format(amount=o.amount, stock=stock))
-            if 0 < o.amount:  # it is a buy order
-                cancel_order(o)
-
-
-def cancel_open_orders(context, data):
-    oo = get_open_orders()
-    if len(oo) == 0:
-        return
-    for stock, orders in oo.iteritems():
-        for o in orders:
-            # message = 'Canceling order of {amount} shares in {stock}'
-            # log.info(message.format(amount=o.amount, stock=stock))
-            cancel_order(o)
-
-# This is the every minute stuff
-
-
-def handle_data(context, data):
-    pass
