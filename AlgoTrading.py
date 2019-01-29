@@ -1,3 +1,5 @@
+$ heroku create myapp --buildpack heroku/python
+
 import alpaca_trade_api as tradeapi
 import pandas as pd
 import time
