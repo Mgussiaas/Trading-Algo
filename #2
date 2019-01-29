@@ -13,8 +13,8 @@ from itertools import cycle
 import alpaca_trade_api as tradeapi
 
 api = tradeapi.REST(
-    key_id='PKJYYYNUT0WLHN5Q8E7G',
-    secret_key='Hgfc7PUdlNDQ/V9MdEgbveO9kfea41d2EFHTY2eD',
+    key_id='PK6S9BBF2PETBP9JKPV7',
+    secret_key='69RzvWczQjVN3wQRF0swNrtj9iVLxmYsImpP03Xr',
     base_url='https://paper-api.alpaca.markets'
 )
 
